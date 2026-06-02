@@ -71,3 +71,48 @@ F407 的 NVIC 优先级是 **4 位（16 级）**，存在 8 位寄存器的**高
 ---
 
 **一句话记忆**：阈值以下（更紧急、数值更小）的中断 = 内核管不着 = 不准碰 API；阈值及以上（数值更大）的中断 = 内核能屏蔽 = 才准调 `FromISR`。
+
+---
+
+## 补充：FromISR —— 中断专用版 API
+
+`...FromISR()` 是 FreeRTOS API 的**中断安全版本**，专门给**中断服务函数（ISR）里**调用。规矩是：
+
+- **在中断里**：必须用 `FromISR` 版，比如 `xQueueSendFromISR()`、`xSemaphoreGiveFromISR()`、`vTaskNotifyGiveFromISR()`。
+- **在任务里**：用普通版 `xQueueSend()`、`xSemaphoreGive()`。
+- **不能混用**：在 ISR 里调普通版（带阻塞的那种）会破坏内核 / 触发断言或 HardFault。
+
+### 为什么要分成两个版本？
+
+**1. ISR 不能阻塞 → FromISR 版没有超时参数**
+
+普通版（如 `xQueueSend(q, &data, portMAX_DELAY)`）可能让**调用者进入阻塞态**等待。但中断**没有任务上下文，不能阻塞**。所以 FromISR 版**砍掉了 timeout 参数**，要么立刻成功、要么立刻失败返回，绝不等待。
+
+**2. FromISR 版自己不切任务，靠 `pxHigherPriorityTaskWoken` 上报**
+
+FromISR 函数最后有个出参 `BaseType_t *pxHigherPriorityTaskWoken`：
+
+- 如果这次操作**唤醒了一个比当前被打断的任务优先级更高的任务**，函数就把 `*pxHigherPriorityTaskWoken = pdTRUE`。
+- 中断不能在中途直接切任务，所以要在 **ISR 末尾**手动调 `portYIELD_FROM_ISR(xHigherPriorityTaskWoken)`，请求退出中断时立刻切到那个高优先级任务（否则它得等到下一个 tick 才被调度，实时性变差）。
+
+典型写法：
+
+```c
+void EXTI0_IRQHandler(void)
+{
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;   // ① 先置 pdFALSE
+
+    /* ...处理中断、清标志... */
+    xSemaphoreGiveFromISR(xSem, &xHigherPriorityTaskWoken);  // ② 唤醒任务
+
+    portYIELD_FROM_ISR(xHigherPriorityTaskWoken);    // ③ 需要就触发切换(本质是挂 PendSV)
+}
+```
+
+### 两点容易误解的地方
+
+1. **不是每个 API 都有 FromISR 版**。只有在中断里调用「有意义」的才有：队列、信号量、任务通知、事件组、软件定时器命令。而**互斥量因为涉及优先级继承，没有 `FromISR` 版**，中断里不能用互斥量。像 `vTaskDelay()`、`xSemaphoreTake(带等待)` 这种「会阻塞」的，**根本没有 FromISR 版**——因为中断没法等。
+
+2. **前提还是上面那条**：能调 `FromISR` 的中断，其抢占优先级数字必须 **≥ `configMAX_SYSCALL_INTERRUPT_PRIORITY`**（F407 上一般是 ≥ 5）。优先级太高（数值太小）的中断连 `FromISR` 都不能调。
+
+**一句话**：`FromISR` = 中断专用版 API，特点是「不阻塞、不自己切任务、用 `pxHigherPriorityTaskWoken` + `portYIELD_FROM_ISR` 来请求切换」。
